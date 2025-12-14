@@ -1,5 +1,5 @@
 """
-Minimal heads-up Texas Hold'em simulator (2 players) based on your pseudocode.
+Minimal heads-up Texas Hold'em simulator (2 players) - Entry point.
 
 Key simplifications (easy to extend later):
 - No blinds/antes (Player1 is forced to open with a raise of 1 each betting round if possible)
@@ -8,181 +8,13 @@ Key simplifications (easy to extend later):
 - Showdown evaluates best 5-card hand out of 7 (2 hole + 5 board)
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass
-from itertools import combinations
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 import random
 
-from agent import Player, Action
-
-
-# ----------------------------
-# Cards / Deck
-# ----------------------------
-
-RANKS = "23456789TJQKA"
-SUITS = "SHDC"  # Spades, Hearts, Diamonds, Clubs
-
-
-@dataclass(frozen=True)
-class Card:
-    rank: str  # '2'..'A'
-    suit: str  # 'S','H','D','C'
-
-    def __str__(self) -> str:
-        return f"{self.rank}{self.suit}"
-
-    @property
-    def rank_value(self) -> int:
-        return RANKS.index(self.rank) + 2  # 2..14
-
-
-class Deck:
-    def __init__(self, rng: random.Random):
-        self.rng = rng
-        self.cards = [Card(r, s) for r in RANKS for s in SUITS]
-        self.rng.shuffle(self.cards)
-
-    def draw(self) -> Card:
-        if not self.cards:
-            raise RuntimeError("Deck is empty")
-        return self.cards.pop()
-
-
-# ----------------------------
-# Board
-# ----------------------------
-
-class Board:
-    """
-    Stores 5 community cards and which are "open" (visible).
-    open_count is used instead of indexes for simplicity:
-      0 => preflop (no community shown)
-      3 => flop
-      4 => turn
-      5 => river
-    """
-    def __init__(self, cards: List[Card]):
-        if len(cards) != 5:
-            raise ValueError("Board must have exactly 5 cards")
-        self.cards = cards
-        self.open_count = 0
-
-    def set_round(self, round_idx: int) -> None:
-        # round 0: 0 open, round 1: 3 open, round 2: 4 open, round 3: 5 open
-        if round_idx == 0:
-            self.open_count = 0
-        elif round_idx == 1:
-            self.open_count = 3
-        elif round_idx == 2:
-            self.open_count = 4
-        elif round_idx == 3:
-            self.open_count = 5
-        else:
-            raise ValueError("round_idx must be 0..3")
-
-    def get_board(self) -> List[str]:
-        visible = []
-        for i, c in enumerate(self.cards):
-            visible.append(str(c) if i < self.open_count else "X")
-        return visible
-
-
-# ----------------------------
-# Hand evaluation (showdown)
-# ----------------------------
-
-def _is_straight(values_desc: List[int]) -> Optional[int]:
-    """
-    values_desc: sorted unique ranks, descending (e.g. [14,13,12,11,10,...])
-    Returns the high card of the straight if present, else None.
-    Handles wheel A-2-3-4-5 as high=5.
-    """
-    vals = sorted(set(values_desc), reverse=True)
-    if 14 in vals:  # Ace can be low
-        vals.append(1)
-
-    run = 1
-    for i in range(len(vals) - 1):
-        if vals[i] - 1 == vals[i + 1]:
-            run += 1
-            if run >= 5:
-                # high card is the start of this 5-run
-                high = vals[i - (run - 2)]
-                return 5 if high == 1 else high
-        else:
-            run = 1
-    return None
-
-
-def rank_5card_hand(cards5: List[Card]) -> Tuple[int, List[int]]:
-    """
-    Returns a comparable rank:
-      (category, kickers...)
-    category: 8 straight flush, 7 quads, 6 full house, 5 flush, 4 straight,
-              3 trips, 2 two pair, 1 pair, 0 high card
-    Kickers list breaks ties.
-    """
-    vals = sorted([c.rank_value for c in cards5], reverse=True)
-    suits = [c.suit for c in cards5]
-
-    # counts
-    counts: Dict[int, int] = {}
-    for v in vals:
-        counts[v] = counts.get(v, 0) + 1
-    # sort by (count desc, value desc)
-    groups = sorted(counts.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)
-
-    is_flush = len(set(suits)) == 1
-    straight_high = _is_straight(vals)
-
-    if is_flush and straight_high is not None:
-        return (8, [straight_high])
-
-    if groups[0][1] == 4:
-        quad = groups[0][0]
-        kicker = max(v for v in vals if v != quad)
-        return (7, [quad, kicker])
-
-    if groups[0][1] == 3 and groups[1][1] == 2:
-        trips = groups[0][0]
-        pair = groups[1][0]
-        return (6, [trips, pair])
-
-    if is_flush:
-        return (5, vals)
-
-    if straight_high is not None:
-        return (4, [straight_high])
-
-    if groups[0][1] == 3:
-        trips = groups[0][0]
-        kickers = [v for v in vals if v != trips]
-        return (3, [trips] + kickers)
-
-    if groups[0][1] == 2 and groups[1][1] == 2:
-        high_pair = max(groups[0][0], groups[1][0])
-        low_pair = min(groups[0][0], groups[1][0])
-        kicker = max(v for v in vals if v != high_pair and v != low_pair)
-        return (2, [high_pair, low_pair, kicker])
-
-    if groups[0][1] == 2:
-        pair = groups[0][0]
-        kickers = [v for v in vals if v != pair]
-        return (1, [pair] + kickers)
-
-    return (0, vals)
-
-
-def best_hand_rank(seven_cards: List[Card]) -> Tuple[int, List[int]]:
-    best = (-1, [])
-    for combo in combinations(seven_cards, 5):
-        r = rank_5card_hand(list(combo))
-        if r > best:
-            best = r
-    return best
+from env.cards import Card, Deck
+from env.board import Board
+from env.hand_evaluator import best_hand_rank
+from agent import Player
 
 
 # ----------------------------
@@ -195,6 +27,7 @@ class Game:
         self.player1 = Player("Player1", starting_cash)
         self.player2 = Player("Player2", starting_cash)
         self.board: Optional[Board] = None
+        self.hand_history: List[List[Tuple[str, str, int]]] = []
 
     def next_hand(self) -> bool:
         """
@@ -287,6 +120,7 @@ class Game:
                 board=self.board,
                 round_idx=round_idx,
                 history=betstate,
+                hand_history=self.hand_history,
             )
 
             if action == "fold":
@@ -352,6 +186,7 @@ class Game:
             pot = 0
             hand_winner: Optional[Player] = None
             tie = False
+            all_rounds_history: List[Tuple[str, str, int]] = []
 
             if verbose:
                 print(f"\n=== Hand {hand_num} ===")
@@ -367,6 +202,7 @@ class Game:
                     print(f"Pot: {pot}")
 
                 betstate, pot, fold_winner = self.bet_round(round_idx, pot)
+                all_rounds_history.extend(betstate)
 
                 if verbose:
                     print("Actions:")
@@ -423,16 +259,15 @@ class Game:
             if verbose:
                 print(f"Stacks: P1={self.player1.stack} P2={self.player2.stack}")
 
+            # Store this hand's betting history
+            self.hand_history.append(all_rounds_history)
+
         if verbose:
             print("\n=== Game Over ===")
         print(f"Final stacks after {hand_num} hands: P1={self.player1.stack}, P2={self.player2.stack}")
 
 
-# ----------------------------
-# Example usage
-# ----------------------------
-
 if __name__ == "__main__":
     game = Game(starting_cash=10)
-    game.play(max_hands=3, verbose=True)  # set verbose=True to see each hand/round
+    game.play(max_hands=3, verbose=True)
     
