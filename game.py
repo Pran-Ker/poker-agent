@@ -2,13 +2,13 @@
 Minimal heads-up Texas Hold'em simulator (2 players) - Entry point.
 
 Key simplifications (easy to extend later):
-- No blinds/antes (Player1 is forced to open with a raise of 1 each betting round if possible)
-- Default player policy: always "call" (i.e., check if nothing to call)
-- Betting is a simple heads-up loop: raise -> response -> end (supports folds and more raises if you later add them)
+- No blinds/antes (both players start with equal stacks)
+- Both players use LLM to make decisions (Player1 acts first each round)
+- Betting is a simple heads-up loop with full raise/call/fold options
 - Showdown evaluates best 5-card hand out of 7 (2 hole + 5 board)
 """
 
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 import random
 
 from env.cards import Card, Deck
@@ -27,7 +27,8 @@ class Game:
         self.player1 = Player("Player1", starting_cash)
         self.player2 = Player("Player2", starting_cash)
         self.board: Optional[Board] = None
-        self.hand_history: List[List[Tuple[str, str, int]]] = []
+        self.hand_history: List[Dict[str, Any]] = []
+        self.hand_counter = 0
 
     def next_hand(self) -> bool:
         """
@@ -61,38 +62,32 @@ class Game:
             player.all_in = True
         return paid
 
-    def bet_round(self, round_idx: int, pot: int) -> Tuple[List[Tuple[str, str, int]], int, Optional[Player]]:
+    def bet_round(self, round_idx: int, pot: int) -> Tuple[List[Dict[str, Any]], int, Optional[Player]]:
         """
         Runs one betting round. Returns:
-          - betstate list: [(player_name, action, amount_put_in_now), ...]
+          - betstate list: [{"player": name, "action": action, "amount": chips_put_in, "street": street}, ...]
           - new pot total
           - winner if someone folded else None
         """
         assert self.board is not None
 
-        betstate: List[Tuple[str, str, int]] = []
+        street_names = ["preflop", "flop", "turn", "river"]
+        street = street_names[round_idx] if round_idx < len(street_names) else f"round_{round_idx}"
+
+        betstate: List[Dict[str, Any]] = []
         contrib = {self.player1.name: 0, self.player2.name: 0}  # this round only
         current_to_call = 0
-        min_raise = 1
+        min_raise = 100
 
         p1, p2 = self.player1, self.player2
 
-        # Force first action: Player1 must "raise(1)" if possible, else just "call/check".
-        if not p1.folded and not p1.all_in and p1.stack > 0:
-            raise_amt = min_raise
-            paid = self._pay_to_pot(p1, raise_amt)
-            contrib[p1.name] += paid
-            pot += paid
-            current_to_call = contrib[p1.name] - contrib[p2.name]
-            betstate.append((p1.name, "raise", paid))
-        else:
-            betstate.append((p1.name, "call", 0))
-
-        # Now Player2 responds, then (optionally) P1 responds to further raises, etc.
-        actor, other = p2, p1
-        pending_response = True  # there is something to respond to if to_call > 0
+        # Player1 acts first (LLM decision, not forced)
+        actor, other = p1, p2
+        pending_response = False  # No action to respond to yet
+        actions_count = 0  # Track number of actions to ensure both players act
 
         while True:
+            actions_count += 1
             if actor.folded or actor.all_in:
                 # if actor can't act, treat as call/check when possible
                 pass
@@ -104,7 +99,7 @@ class Game:
 
             if actor.all_in:
                 # can't add more; if still behind, it's effectively an all-in call of zero additional
-                betstate.append((actor.name, "call", 0))
+                betstate.append({"player": actor.name, "action": "call", "amount": 0, "street": street})
                 if pending_response and to_call == 0:
                     pending_response = False
                 if not pending_response:
@@ -125,20 +120,21 @@ class Game:
 
             if action == "fold":
                 actor.folded = True
-                betstate.append((actor.name, "fold", 0))
+                betstate.append({"player": actor.name, "action": "fold", "amount": 0, "street": street})
                 return betstate, pot, other
 
             if action == "call":
                 paid = self._pay_to_pot(actor, to_call)
                 contrib[actor.name] += paid
                 pot += paid
-                betstate.append((actor.name, "call", paid))
+                betstate.append({"player": actor.name, "action": "call", "amount": paid, "street": street})
 
                 # If they fully matched, response is complete
                 if contrib[actor.name] >= contrib[other.name]:
                     pending_response = False
 
-                if not pending_response:
+                # End round only if no pending response AND both players have acted (at least 2 actions)
+                if not pending_response and actions_count >= 2:
                     return betstate, pot, None
 
             elif action == "raise":
@@ -148,7 +144,7 @@ class Game:
                 paid = self._pay_to_pot(actor, total_put_in)
                 contrib[actor.name] += paid
                 pot += paid
-                betstate.append((actor.name, "raise", paid))
+                betstate.append({"player": actor.name, "action": "raise", "amount": paid, "street": street})
                 pending_response = True  # other must respond
 
             else:
@@ -157,9 +153,6 @@ class Game:
             actor, other = other, actor  # switch turns
 
     def showdown(self, pot: int) -> Player:
-        """
-        Determine winner at showdown (both not folded).
-        """
         assert self.board is not None
         p1, p2 = self.player1, self.player2
 
@@ -168,25 +161,31 @@ class Game:
 
         r1 = best_hand_rank(seven1)
         r2 = best_hand_rank(seven2)
-
         if r1 > r2:
             return p1
         if r2 > r1:
             return p2
-
-        # Tie-break: split pot. For simplicity return Player1 but split outside.
         return p1
 
     def play(self, max_hands: int = 1000, verbose: bool = False) -> None:
         hand_num = 0
         while hand_num < max_hands and self.next_hand():
             hand_num += 1
+            self.hand_counter += 1
             assert self.board is not None
+
+            # Record starting state for hand metadata
+            starting_stacks = {
+                self.player1.name: self.player1.stack,
+                self.player2.name: self.player2.stack
+            }
+            button = self.player2.name if hand_num % 2 == 0 else self.player1.name
 
             pot = 0
             hand_winner: Optional[Player] = None
             tie = False
-            all_rounds_history: List[Tuple[str, str, int]] = []
+            all_rounds_history: List[Dict[str, Any]] = []
+            went_to_showdown = False
 
             if verbose:
                 print(f"\n=== Hand {hand_num} ===")
@@ -206,7 +205,10 @@ class Game:
 
                 if verbose:
                     print("Actions:")
-                    for player_name, action, amount in betstate:
+                    for act in betstate:
+                        player_name = act["player"]
+                        action = act["action"]
+                        amount = act["amount"]
                         if action == "fold":
                             print(f"  {player_name}: {action}")
                         elif amount > 0:
@@ -227,6 +229,7 @@ class Game:
 
             if hand_winner is None:
                 # showdown (or tie)
+                went_to_showdown = True
                 winner = self.showdown(pot)
                 # check if true tie
                 r1 = best_hand_rank(self.player1.hole + self.board.cards)
@@ -259,15 +262,41 @@ class Game:
             if verbose:
                 print(f"Stacks: P1={self.player1.stack} P2={self.player2.stack}")
 
-            # Store this hand's betting history
-            self.hand_history.append(all_rounds_history)
+            # Build board runout
+            board_dict: Dict[str, List[str]] = {}
+            if len(self.board.cards) >= 3:
+                board_dict["flop"] = [str(c) for c in self.board.cards[:3]]
+            if len(self.board.cards) >= 4:
+                board_dict["turn"] = [str(self.board.cards[3])]
+            if len(self.board.cards) >= 5:
+                board_dict["river"] = [str(self.board.cards[4])]
+
+            # Build showdown info (only if hand went to showdown)
+            showdown_dict: Optional[Dict[str, Optional[List[str]]]] = None
+            if went_to_showdown:
+                showdown_dict = {
+                    self.player1.name: [str(c) for c in self.player1.hole],
+                    self.player2.name: [str(c) for c in self.player2.hole]
+                }
+
+            # Store structured hand record
+            hand_record = {
+                "hand_id": self.hand_counter,
+                "button": button,
+                "starting_stacks": starting_stacks,
+                "actions": all_rounds_history,
+                "board": board_dict,
+                "showdown": showdown_dict,
+                "result": {
+                    "winner": hand_winner.name if hand_winner and not tie else "tie",
+                    "pot": pot
+                }
+            }
+            self.hand_history.append(hand_record)
 
         if verbose:
             print("\n=== Game Over ===")
         print(f"Final stacks after {hand_num} hands: P1={self.player1.stack}, P2={self.player2.stack}")
 
 
-if __name__ == "__main__":
-    game = Game(starting_cash=10)
-    game.play(max_hands=3, verbose=True)
     

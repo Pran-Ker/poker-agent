@@ -4,9 +4,11 @@ Override the get_action method to implement custom strategies.
 """
 
 from __future__ import annotations
-from typing import List, Tuple, Dict, Any, TYPE_CHECKING
+from typing import List, Tuple, Dict, Any, TYPE_CHECKING, Optional
 import os
 import json
+from collections import defaultdict
+from datetime import datetime
 from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
@@ -42,19 +44,21 @@ class Player:
         pot: int,
         board: Board,
         round_idx: int,
-        history: List[Tuple[str, str, int]],
-        hand_history: List[List[Tuple[str, str, int]]],
+        history: List[Dict[str, Any]],
+        hand_history: List[Dict[str, Any]],
     ) -> Action:
         """
-        Model-based action selection (no truncation of history).
+        Model-based action selection with structured history and opponent stats.
 
         Args:
-            history: Betting history for current round [(player, action, amount), ...]
-            hand_history: History of previous hands, each containing its betting history
-                         [[(player, action, amount), ...], ...]
+            history: Betting history for current round [{"player": ..., "action": ..., "amount": ..., "street": ...}, ...]
+            hand_history: Structured history of previous hands with metadata
         """
         # Log what the agent sees before making decision
         self._log_game_state(to_call, min_raise, pot, board, round_idx, history)
+
+        # Extract visible board cards (no X placeholders)
+        visible_cards = [str(c) for i, c in enumerate(board.cards) if i < board.open_count]
 
         result = call_model(
             player_name=self.name,
@@ -63,7 +67,7 @@ class Player:
             to_call=to_call,
             min_raise=min_raise,
             pot=pot,
-            board_view=board.get_board(),
+            board_cards=visible_cards,
             round_idx=round_idx,
             history=history,               # keep full
             hand_history=hand_history,     # keep full
@@ -79,7 +83,7 @@ class Player:
 
         if action == "call":
             self._log_action("call", to_call)
-            return ("call", 0)
+            return ("call", to_call)
 
         if action == "raise":
             # enforce min_raise on raise size
@@ -90,7 +94,7 @@ class Player:
 
         # Fallback if model returns something unexpected
         self._log_action("call (fallback)", to_call)
-        return ("call", 0)
+        return ("call", to_call)
 
     def _log_game_state(
         self,
@@ -99,7 +103,7 @@ class Player:
         pot: int,
         board: Board,
         round_idx: int,
-        history: List[Tuple[str, str, int]],
+        history: List[Dict[str, Any]],
     ) -> None:
         """Log the game state that the agent sees."""
         # Create a table for game state
@@ -131,8 +135,10 @@ class Player:
 
         # Current round history
         if history:
-            history_str = ", ".join([f"{player}: {action}" + (f" ${amt}" if amt > 0 else "")
-                                     for player, action, amt in history])
+            history_str = ", ".join([
+                f"{act['player']}: {act['action']}" + (f" ${act['amount']}" if act['amount'] > 0 else "")
+                for act in history
+            ])
             table.add_row("History:", history_str)
 
         console.print(Panel(table, title=f"[bold]{self.name}'s Turn[/bold]", border_style="blue"))
@@ -154,6 +160,115 @@ class Player:
         return f"{self.name}(stack={self.stack}, hole={[str(c) for c in self.hole]})"
 
 
+def log_model_trace(input_data: Dict[str, Any], output_data: str, log_file: str = "model_traces.jsonl") -> None:
+    """
+    Log model input/output to JSONL for finetuning.
+
+    Format: {"input": {...}, "output": {...}}
+    One line per model call.
+    """
+    trace = {
+        "input": input_data,
+        "output": output_data
+    }
+
+    with open(log_file, "a") as f:
+        f.write(json.dumps(trace, ensure_ascii=False) + "\n")
+
+
+def summarize_opponent(hand_history: List[Dict[str, Any]], hero_name: str) -> Dict[str, Any]:
+    """
+    Compute opponent statistics from hand history.
+
+    Args:
+        hand_history: List of structured hand records
+        hero_name: Name of the hero player (to filter out their actions)
+
+    Returns:
+        Dictionary of opponent statistics including:
+        - hands_seen: total hands played
+        - action_freq_by_street: frequency of fold/call/raise per street
+        - avg_raise_amount: average raise size
+        - aggression_factor: raises / calls ratio
+        - fold_after_raise_rate: how often opponent raises then folds later
+    """
+    if not hand_history:
+        return {
+            "hands_seen": 0,
+            "action_freq_by_street": {},
+            "avg_raise_amount": 0.0,
+            "aggression_factor": 0.0,
+            "fold_after_raise_rate": 0.0,
+            "note": "No history available"
+        }
+
+    hands_seen = len(hand_history)
+    action_counts = defaultdict(lambda: defaultdict(int))  # street -> action -> count
+    raise_amounts = []
+    hands_where_opp_raised = 0
+    hands_where_opp_raised_then_folded = 0
+    total_raises = 0
+    total_calls = 0
+
+    for hand in hand_history:
+        actions = hand.get("actions", [])
+        opp_raised_this_hand = False
+        opp_folded_this_hand = False
+
+        for action in actions:
+            player = action.get("player")
+            if player == hero_name:
+                continue  # Skip hero actions
+
+            act_type = action.get("action")
+            amount = action.get("amount", 0)
+            street = action.get("street", "unknown")
+
+            # Count action by street
+            action_counts[street][act_type] += 1
+
+            # Track raises
+            if act_type == "raise":
+                total_raises += 1
+                opp_raised_this_hand = True
+                if amount > 0:
+                    raise_amounts.append(amount)
+            elif act_type == "call":
+                total_calls += 1
+            elif act_type == "fold":
+                opp_folded_this_hand = True
+
+        # Track raise-then-fold pattern
+        if opp_raised_this_hand:
+            hands_where_opp_raised += 1
+            if opp_folded_this_hand:
+                hands_where_opp_raised_then_folded += 1
+
+    # Compute aggregate stats
+    avg_raise = sum(raise_amounts) / len(raise_amounts) if raise_amounts else 0.0
+    aggression = total_raises / max(1, total_calls)
+    fold_after_raise_rate = (hands_where_opp_raised_then_folded / max(1, hands_where_opp_raised)
+                             if hands_where_opp_raised > 0 else 0.0)
+
+    # Compute action frequencies by street
+    action_freq_by_street = {}
+    for street, counts in action_counts.items():
+        total_actions = sum(counts.values())
+        action_freq_by_street[street] = {
+            action: count / total_actions
+            for action, count in counts.items()
+        }
+
+    return {
+        "hands_seen": hands_seen,
+        "action_freq_by_street": action_freq_by_street,
+        "avg_raise_amount": round(avg_raise, 2),
+        "aggression_factor": round(aggression, 2),
+        "fold_after_raise_rate": round(fold_after_raise_rate, 2),
+        "total_opponent_raises": total_raises,
+        "total_opponent_calls": total_calls
+    }
+
 
 def call_model(
     *,
@@ -163,25 +278,12 @@ def call_model(
     to_call: int,
     min_raise: int,
     pot: int,
-    board_view: List[str],
+    board_cards: List[str],
     round_idx: int,
-    history: List[Tuple[str, str, int]],
-    hand_history: List[List[Tuple[str, str, int]]],
+    history: List[Dict[str, Any]],
+    hand_history: List[Dict[str, Any]],
     model: str = "gpt-4o",
 ) -> Dict[str, Any]:
-    """
-    Calls an LLM using the standard OpenAI Chat Completions interface.
-
-    Returns a dict like:
-      {"action": "call", "amount": 0}
-      {"action": "raise", "amount": 10}
-      {"action": "fold", "amount": 0}
-
-    Notes:
-    - Does NOT truncate history or hand_history.
-    - Uses JSON-only output to keep parsing robust.
-    - You can swap model name via the 'model' parameter.
-    """
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -191,6 +293,8 @@ def call_model(
     client = OpenAI(api_key=api_key)
 
     system_prompt = """You are a poker agent playing heads-up Texas Hold'em.
+Your goal is to maximize your stack through exploitative play.
+
 Your task: output the next action as strict JSON with keys:
 - "action": one of ["fold","call","raise"]
 - "amount": integer raise size if action=="raise", else 0
@@ -199,20 +303,45 @@ Rules:
 - If you choose "raise", your amount MUST be >= min_raise.
 - If you choose "call", that means match the required to_call (or check if to_call==0).
 - Output JSON ONLY. No prose. No markdown.
+
+History Format:
+- previous_hands_recent: List of recent hands with full context (actions, board, showdown, results)
+- Each action includes: player, action, amount (chips committed), street (preflop/flop/turn/river)
+- opponent_summary: Aggregate statistics about opponent tendencies
+
+How to Use History:
+- Use opponent_summary to understand overall tendencies (aggression, fold rates, raise patterns)
+- Use previous_hands_recent to identify recent patterns and adjust accordingly
+- Look for exploitable patterns: frequent bluffs, tight play, positional tendencies
 """
 
-    # Keep full histories: no truncation.
+    # Compute opponent summary statistics
+    opponent_summary = summarize_opponent(hand_history, player_name)
+
+    # Send recent hands (last 20) + opponent summary instead of all history
+    recent_hands = hand_history[-20:] if len(hand_history) > 20 else hand_history
+
+    # Derive street name from round_idx
+    street_names = ["preflop", "flop", "turn", "river"]
+    street = street_names[round_idx] if round_idx < len(street_names) else f"round_{round_idx}"
+
     payload = {
         "player_name": player_name,
         "hole_cards": hole_cards,
         "stack": stack,
-        "round_idx": round_idx,
-        "board_view": board_view,
+        "street": street,
+        "board_cards": board_cards,
         "pot": pot,
         "to_call": to_call,
         "min_raise": min_raise,
         "current_round_history": history,
-        "previous_hands_history": hand_history,
+        "previous_hands_recent": recent_hands,
+        "opponent_summary": opponent_summary,
+        "history_spec": {
+            "action_format": "Each action has: player, action, amount, street",
+            "amount_semantics": "Chips committed on that specific action",
+            "streets": "preflop, flop, turn, river"
+        }
     }
 
     user_prompt = (
@@ -222,18 +351,27 @@ Rules:
     )
 
 
-    console.print(f"Calling model {model} with payload: {payload}")
+    # console.print(f"Calling model {model} with payload: {payload}")
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
     resp = client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        messages=messages,
         response_format={"type": "json_object"},
         temperature=0.2,
     )
 
     content = resp.choices[0].message.content or "{}"
+
+    # Log input/output for finetuning
+    log_model_trace(
+        input_data=messages,
+        output_data=content
+    )
+
     data = json.loads(content)
 
     # Minimal normalization
