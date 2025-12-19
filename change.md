@@ -1,4 +1,5 @@
-2. Normalize money
+2. 
+
 	
 	3. Opponent summary: add uncertainty / sample size per stat
 

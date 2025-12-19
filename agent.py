@@ -14,6 +14,13 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from env.normalization import (
+    normalize,
+    denormalize,
+    normalize_action_history,
+    normalize_hand_history,
+)
+
 console = Console()
 
 if TYPE_CHECKING:
@@ -46,6 +53,7 @@ class Player:
         round_idx: int,
         history: List[Dict[str, Any]],
         hand_history: List[Dict[str, Any]],
+        starting_stack: int,
     ) -> Action:
         """
         Model-based action selection with structured history and opponent stats.
@@ -69,12 +77,15 @@ class Player:
             pot=pot,
             board_cards=visible_cards,
             round_idx=round_idx,
-            history=history,               # keep full
-            hand_history=hand_history,     # keep full
+            history=history,
+            hand_history=hand_history,
+            starting_stack=starting_stack,
         )
 
         action = result.get("action")
-        amount = int(result.get("amount", 0) or 0)
+        # Denormalize: model returns fraction, convert back to chips
+        normalized_amount = float(result.get("amount", 0) or 0)
+        amount = denormalize(normalized_amount, starting_stack)
 
         # Safety / validity clamps
         if action == "fold":
@@ -282,6 +293,7 @@ def call_model(
     round_idx: int,
     history: List[Dict[str, Any]],
     hand_history: List[Dict[str, Any]],
+    starting_stack: int,
     model: str = "gpt-4o",
 ) -> Dict[str, Any]:
 
@@ -297,21 +309,26 @@ Your goal is to maximize your stack through exploitative play.
 
 Your task: output the next action as strict JSON with keys:
 - "action": one of ["fold","call","raise"]
-- "amount": integer raise size if action=="raise", else 0
+- "amount": raise size if action=="raise", else 0
+
+IMPORTANT - Normalized Values:
+All monetary values are normalized as fractions of starting stack (0.0 to 1.0+).
+Examples: stack=0.9 means 90% of starting stack, pot=0.5 means pot is half starting stack.
+When raising, output the fraction you want to raise (e.g., 0.2 = 20% of starting stack).
 
 Rules:
 - If you choose "raise", your amount MUST be >= min_raise.
 - If you choose "call", that means match the required to_call (or check if to_call==0).
 - Output JSON ONLY. No prose. No markdown.
 
-History Format:
-- previous_hands_recent: List of recent hands with full context (actions, board, showdown, results)
-- Each action includes: player, action, amount (chips committed), street (preflop/flop/turn/river)
-- opponent_summary: Aggregate statistics about opponent tendencies
+Game State:
+- street: Current betting round ("preflop", "flop", "turn", "river")
+- board_cards: Visible community cards (empty for preflop, 3 for flop, 4 for turn, 5 for river)
+- All amounts in history are normalized fractions of starting stack
 
-How to Use History:
-- Use opponent_summary to understand overall tendencies (aggression, fold rates, raise patterns)
-- Use previous_hands_recent to identify recent patterns and adjust accordingly
+History:
+- previous_hands_recent: Recent hands with full context (actions, board, showdown, results)
+- opponent_summary: Aggregate statistics about opponent tendencies
 - Look for exploitable patterns: frequent bluffs, tight play, positional tendencies
 """
 
@@ -325,23 +342,19 @@ How to Use History:
     street_names = ["preflop", "flop", "turn", "river"]
     street = street_names[round_idx] if round_idx < len(street_names) else f"round_{round_idx}"
 
+    # Normalize all monetary values by starting stack
     payload = {
         "player_name": player_name,
         "hole_cards": hole_cards,
-        "stack": stack,
+        "stack": normalize(stack, starting_stack),
         "street": street,
         "board_cards": board_cards,
-        "pot": pot,
-        "to_call": to_call,
-        "min_raise": min_raise,
-        "current_round_history": history,
-        "previous_hands_recent": recent_hands,
+        "pot": normalize(pot, starting_stack),
+        "to_call": normalize(to_call, starting_stack),
+        "min_raise": normalize(min_raise, starting_stack),
+        "current_round_history": normalize_action_history(history, starting_stack),
+        "previous_hands_recent": normalize_hand_history(recent_hands, starting_stack),
         "opponent_summary": opponent_summary,
-        "history_spec": {
-            "action_format": "Each action has: player, action, amount, street",
-            "amount_semantics": "Chips committed on that specific action",
-            "streets": "preflop, flop, turn, river"
-        }
     }
 
     user_prompt = (

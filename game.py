@@ -24,6 +24,7 @@ from agent import Player
 class Game:
     def __init__(self, starting_cash: int = 10, seed: Optional[int] = None):
         self.rng = random.Random(seed)
+        self.starting_stack = starting_cash
         self.player1 = Player("Player1", starting_cash)
         self.player2 = Player("Player2", starting_cash)
         self.board: Optional[Board] = None
@@ -116,6 +117,7 @@ class Game:
                 round_idx=round_idx,
                 history=betstate,
                 hand_history=self.hand_history,
+                starting_stack=self.starting_stack,
             )
 
             if action == "fold":
