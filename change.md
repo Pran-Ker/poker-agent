@@ -1,6 +1,4 @@
 2. 
-
-	
 	3. Opponent summary: add uncertainty / sample size per stat
 
 Your opponent_summary is fine in spirit, but make it confidence-aware:
